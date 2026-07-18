@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+release-staging/
+release-files/
+*.egg-info/
+*.zip
+*.zip.sha256
+.venv/
+.pytest_cache/

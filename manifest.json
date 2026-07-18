@@ -1,0 +1,60 @@
+{
+  "manifest_version": 1,
+  "id": "org.subtitld.realtimestt",
+  "version": "0.1.0",
+  "display_name": "RealtimeSTT",
+  "summary": "Recording-based speech-to-text via RealtimeSTT (faster-whisper + VAD). Built for Subtitld's Record mode; also transcribes imported audio. GPU-accelerated when available.",
+  "author": "Subtitld",
+  "homepage": "https://github.com/Subtitld/addon-realtimestt",
+  "license": "MIT",
+  "executable": "realtimestt-addon/realtimestt-addon",
+  "protocol": 1,
+  "startup_timeout_sec": 20,
+  "request_timeout_sec": 900,
+  "platforms": ["linux", "macos", "windows"],
+  "tasks": ["asr.transcribe"],
+  "languages": [
+    "en", "pt", "pt-br", "es", "fr", "de", "it", "nl", "ru", "pl", "uk", "tr",
+    "ar", "zh", "ja", "ko", "hi", "id", "sv", "fi", "da", "no", "cs", "el",
+    "he", "ro", "hu", "ca", "th", "vi"
+  ],
+  "models": [],
+  "disk_required_mb": 500,
+  "ram_required_mb": 2048,
+  "gpu": "optional",
+  "config_schema": {
+    "fields": [
+      {
+        "key": "model",
+        "type": "select",
+        "label": "Model",
+        "description": "faster-whisper model used by RealtimeSTT. Larger = more accurate but slower and heavier. Downloaded from Hugging Face on first use and cached.",
+        "options": ["tiny", "base", "small", "medium", "large-v3", "tiny.en", "base.en", "small.en", "medium.en"],
+        "default": "small"
+      },
+      {
+        "key": "device",
+        "type": "select",
+        "label": "Device",
+        "description": "Where inference runs. 'auto' uses CUDA when a compatible GPU is present, otherwise CPU.",
+        "options": ["auto", "cpu", "cuda"],
+        "default": "auto"
+      },
+      {
+        "key": "compute_type",
+        "type": "select",
+        "label": "Compute type",
+        "description": "faster-whisper precision. 'default' lets the backend choose; 'int8' is fastest on CPU; 'float16' suits GPUs.",
+        "options": ["default", "int8", "int8_float16", "float16", "float32"],
+        "default": "default"
+      },
+      {
+        "key": "realtime",
+        "type": "bool",
+        "label": "Stream interim results",
+        "description": "Emit refining partial text while a phrase is still being decoded. Turn off for a single final result per phrase.",
+        "default": true
+      }
+    ]
+  }
+}

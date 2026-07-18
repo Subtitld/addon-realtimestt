@@ -1,0 +1,13 @@
+# Catalog entry for RealtimeSTT — paste into the `addons:` list of
+# `addons.yml` in the Subtitld/addons-catalog repo. `id` matches the
+# manifest.json id inside the release zip; `repo` is the GitHub repo name.
+# After a GitHub Release is cut here, addons-catalog regenerates catalog.json.
+
+  - id: org.subtitld.realtimestt
+    repo: addon-realtimestt
+    display_name: RealtimeSTT
+    summary: Recording-based speech-to-text (faster-whisper + VAD) for Record mode.
+    tasks: [asr.transcribe]
+    languages: [en, en-us, pt, pt-br, es, fr, de, it, nl, ru, zh, ja, ko]
+    license: MIT
+    homepage: https://github.com/Subtitld/addon-realtimestt
