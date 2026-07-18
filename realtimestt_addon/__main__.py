@@ -10,7 +10,7 @@ panel.
 
 Protocol (JSON, one object per line, over stdio):
 
-  us -> host   {"type":"hello","protocol":1,"addon":"org.subtitld.realtimestt",...}
+  us -> host   {"type":"hello","protocol":1,"addon":"realtimestt",...}
   host -> us   {"type":"ready","host":"<ver>"}
   host -> us   {"id","type":"asr.transcribe","params":{audio_path,language,options}}
   us -> host   {"id","type":"progress","value":0..1,"message":str}
@@ -21,8 +21,8 @@ Protocol (JSON, one object per line, over stdio):
 
 Configuration arrives as environment variables. Subtitld converts each
 ``config_schema`` option into ``<ID>_<KEY>`` where ``ID`` is the manifest id
-uppercased with ``-`` → ``_`` (dots kept), i.e. ``ORG.SUBTITLD.REALTIMESTT_``.
-We derive that prefix from ADDON_ID so the two never drift:
+uppercased with ``-`` → ``_``, i.e. ``REALTIMESTT_``. We derive that prefix
+from ADDON_ID so the two never drift:
 
   <PREFIX>MODEL         faster-whisper model (tiny|base|small|medium|large-v3|.en)  default: small
   <PREFIX>DEVICE        cuda | cpu | auto      default: auto

@@ -6,5 +6,7 @@ PyInstaller binary (`realtimestt-addon`).
 """
 
 __version__ = '0.1.0'
-ADDON_ID = 'org.subtitld.realtimestt'
+# Dotless id — matches the Subtitld add-on catalog convention (asset names are
+# `<id>-<version>-<platform>.zip`, and the catalog's parser rejects dots).
+ADDON_ID = 'realtimestt'
 PROTOCOL_VERSION = 1

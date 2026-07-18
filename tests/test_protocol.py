@@ -58,7 +58,7 @@ def run_conformance():
     hello = read()
     if not hello or hello.get('type') != 'hello':
         return ['no-hello']
-    if hello.get('addon') != 'org.subtitld.realtimestt':
+    if hello.get('addon') != 'realtimestt':
         fails.append('bad-addon-id:' + str(hello.get('addon')))
     if hello.get('protocol') != 1:
         fails.append('bad-protocol')

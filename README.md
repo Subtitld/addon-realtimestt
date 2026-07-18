@@ -91,7 +91,7 @@ which Subtitld fetches from `https://subtitld.github.io/addons-catalog/catalog.j
 
 | Direction | Frame |
 |---|---|
-| add-on → host | `{"type":"hello","protocol":1,"addon":"org.subtitld.realtimestt","capabilities":[{"task":"asr.transcribe","languages":[…]}]}` |
+| add-on → host | `{"type":"hello","protocol":1,"addon":"realtimestt","capabilities":[{"task":"asr.transcribe","languages":[…]}]}` |
 | host → add-on | `{"type":"ready","host":"<ver>"}` |
 | host → add-on | `{"id","type":"asr.transcribe","params":{"audio_path","language","options"}}` |
 | add-on → host | `{"id","type":"progress","value":0..1,"message"}` |

@@ -28,10 +28,9 @@ jobs:
         include:
           - os: ubuntu-22.04
             platform_label: linux-x86_64
-          - os: macos-14
+          - os: macos-14   # Apple Silicon; the catalog can't distinguish mac
+                           # arch, so we ship one macOS build (arm64) for v0.1.
             platform_label: macos-arm64
-          - os: macos-13
-            platform_label: macos-x86_64
           - os: windows-2022
             platform_label: windows-x86_64
 
@@ -64,7 +63,7 @@ jobs:
           cp -r dist/realtimestt-addon/. release-staging/realtimestt-addon/
           # manifest.json / LICENSE / README at the archive ROOT.
           cp manifest.json LICENSE README.md release-staging/
-          archive_name="org.subtitld.realtimestt-${version}-${{ matrix.platform_label }}.zip"
+          archive_name="realtimestt-${version}-${{ matrix.platform_label }}.zip"
           ( cd release-staging && \
             python -c "import shutil,sys; shutil.make_archive(sys.argv[1], 'zip', '.')" "../${archive_name%.zip}" )
           ls -lah "$archive_name"
@@ -98,7 +97,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-files
-          find artefacts -type f -name 'org.subtitld.realtimestt-*' -exec cp {} release-files/ \;
+          find artefacts -type f -name 'realtimestt-*' -exec cp {} release-files/ \;
           ls -lah release-files
       - name: Create release
         uses: softprops/action-gh-release@v2
