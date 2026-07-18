@@ -42,6 +42,17 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install PortAudio
+        # RealtimeSTT pulls PyAudio, which needs PortAudio headers to build on
+        # Linux/macOS. We never open a mic (use_microphone=False) but PyAudio
+        # must import. Windows PyAudio installs from a prebuilt wheel.
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux) sudo apt-get update && sudo apt-get install -y portaudio19-dev ;;
+            macOS) brew install portaudio ;;
+          esac
+
       - name: Install build deps
         shell: bash
         run: |
