@@ -53,6 +53,16 @@ jobs:
             macOS) brew install portaudio ;;
           esac
 
+      - name: Install CPU-only torch (Linux)
+        # On Linux `pip install torch` pulls the CUDA build + nvidia libs
+        # (~3.8 GB bundle, over GitHub's 2 GiB release-asset limit). We only
+        # use torch for lightweight VAD — whisper runs on CTranslate2 — so the
+        # CPU wheel is plenty and keeps the bundle small. macOS/Windows already
+        # default to CPU torch.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
       - name: Install build deps
         shell: bash
         run: |
