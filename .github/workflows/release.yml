@@ -73,6 +73,19 @@ jobs:
         shell: bash
         run: pyinstaller pyinstaller.spec --noconfirm
 
+      - name: Verify the STT engine is bundled
+        # RealtimeSTT makes faster-whisper an optional extra; if the dependency
+        # or PyInstaller collection ever drops it, the add-on modulenotfounds at
+        # transcribe time. Fail the build here instead of shipping it.
+        shell: bash
+        run: |
+          for pkg in faster_whisper ctranslate2; do
+            if ! find dist/realtimestt-addon -iname "*${pkg}*" | grep -q .; then
+              echo "ERROR: ${pkg} missing from the bundle"; exit 1
+            fi
+          done
+          echo "faster_whisper + ctranslate2 present in bundle"
+
       - name: Stage release archive
         shell: bash
         run: |

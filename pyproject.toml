@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subtitld-addon-realtimestt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Subtitld add-on: recording-based ASR via RealtimeSTT (faster-whisper + VAD)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -13,7 +13,7 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "RealtimeSTT>=0.3.0",
+    "RealtimeSTT[faster-whisper]>=0.3.0",
 ]
 
 [project.optional-dependencies]
