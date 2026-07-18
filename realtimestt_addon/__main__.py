@@ -36,9 +36,11 @@ contract can be verified without downloading a model.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
+import threading
 import wave
 
 try:
@@ -60,9 +62,14 @@ LANGUAGES = [
 ]
 
 
+_SEND_LOCK = threading.Lock()   # streaming emits from a worker thread too
+
+
 def _send(frame: dict) -> None:
-    sys.stdout.write(json.dumps(frame, separators=(',', ':')) + '\n')
-    sys.stdout.flush()
+    line = json.dumps(frame, separators=(',', ':')) + '\n'
+    with _SEND_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def _log(msg: str) -> None:
@@ -185,6 +192,136 @@ def _realtimestt_transcribe(pcm: bytes, duration: float, language: str,
 
 
 # --------------------------------------------------------------------------- #
+# Live streaming (asr.stream / asr.audio / asr.stop)                           #
+# --------------------------------------------------------------------------- #
+_STREAM = None  # current session state, or None
+
+
+def _stream_recorder(language: str):
+    """A RealtimeSTT recorder wired for continuous, interim-emitting use."""
+    from RealtimeSTT import AudioToTextRecorder
+    device = _env('DEVICE', 'auto') or 'auto'
+    if device == 'auto':
+        try:
+            import torch
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        except Exception:
+            device = 'cpu'
+    model = _env('MODEL', 'small') or 'small'
+    forced = _env('LANGUAGE') or language or ''
+    return AudioToTextRecorder(
+        model=model,
+        device=device,
+        compute_type=_env('COMPUTE_TYPE', 'default') or 'default',
+        language=forced.split('-')[0] if forced else '',
+        use_microphone=False,
+        spinner=False,
+        enable_realtime_transcription=True,
+        realtime_model_type=model,
+        level=0,
+        no_log_file=True,
+    )
+
+
+def _handle_stream_start(frame: dict) -> None:
+    global _STREAM
+    sid = frame.get('id')
+    params = frame.get('params', {}) or {}
+    language = str(params.get('language', '') or '')
+    fake = os.environ.get('SUBTITLD_REALTIMESTT_FAKE') == '1'
+    _STREAM = {'id': sid, 'fake': fake, 'segments': [], 'audio_count': 0,
+               'stop': threading.Event(), 'recorder': None, 'thread': None}
+
+    if fake:
+        return   # interim/final are driven by incoming asr.audio frames
+
+    try:
+        recorder = _stream_recorder(language)
+    except ImportError as exc:
+        _send({'id': sid, 'type': 'error', 'code': 'not_installed',
+               'message': f'RealtimeSTT unavailable: {exc}'})
+        _STREAM = None
+        return
+    except Exception as exc:
+        _send({'id': sid, 'type': 'error', 'code': 'internal',
+               'message': f'could not start stream: {exc}'})
+        _STREAM = None
+        return
+    _STREAM['recorder'] = recorder
+
+    def _on_realtime(text):
+        t = (text or '').strip()
+        if t and _STREAM is not None and _STREAM['id'] == sid:
+            _send({'id': sid, 'type': 'partial',
+                   'data': {'start': 0.0, 'end': 0.0, 'text': t, 'speaker': 'A', 'final': False}})
+    try:
+        recorder.on_realtime_transcription_update = _on_realtime
+    except Exception:
+        pass
+
+    def _sentence_loop():
+        # recorder.text() blocks until a full sentence; loop until stopped.
+        while _STREAM is not None and not _STREAM['stop'].is_set():
+            try:
+                sentence = recorder.text()
+            except Exception:
+                break
+            s = (sentence or '').strip()
+            if not s or _STREAM is None:
+                continue
+            seg = {'start': 0.0, 'end': 0.0, 'text': s, 'speaker': 'A'}
+            _STREAM['segments'].append(seg)
+            _send({'id': sid, 'type': 'partial', 'data': {**seg, 'final': True}})
+
+    th = threading.Thread(target=_sentence_loop, daemon=True)
+    _STREAM['thread'] = th
+    th.start()
+
+
+def _handle_stream_audio(frame: dict) -> None:
+    st = _STREAM
+    if not st or st['id'] != frame.get('id'):
+        return
+    data = frame.get('data', {}) or {}
+    pcm = base64.b64decode(data['pcm']) if data.get('pcm') else b''
+
+    if st['fake']:
+        st['audio_count'] += 1
+        n = st['audio_count']
+        _send({'id': st['id'], 'type': 'partial',
+               'data': {'start': 0.0, 'end': 0.0, 'text': f'interim {n}', 'speaker': 'A', 'final': False}})
+        if n % 3 == 0:   # commit a "sentence" every 3rd chunk
+            seg = {'start': 0.0, 'end': 0.0, 'text': f'sentence {len(st["segments"]) + 1}', 'speaker': 'A'}
+            st['segments'].append(seg)
+            _send({'id': st['id'], 'type': 'partial', 'data': {**seg, 'final': True}})
+        return
+
+    rec = st.get('recorder')
+    if rec is not None and pcm:
+        try:
+            rec.feed_audio(pcm, original_sample_rate=16000)
+        except Exception as exc:
+            _log(f'feed_audio failed: {exc}')
+
+
+def _handle_stream_stop(frame: dict) -> None:
+    global _STREAM
+    st = _STREAM
+    if not st or st['id'] != frame.get('id'):
+        return
+    sid = st['id']
+    st['stop'].set()
+    rec = st.get('recorder')
+    if rec is not None:
+        try:
+            rec.stop()      # unblocks a pending text() so the loop can exit
+        except Exception:
+            pass
+    _send({'id': sid, 'type': 'result', 'data': {'segments': st['segments']}})
+    _STREAM = None
+
+
+# --------------------------------------------------------------------------- #
 # Request handling                                                             #
 # --------------------------------------------------------------------------- #
 def _handle_transcribe(frame: dict) -> None:
@@ -238,6 +375,7 @@ def main() -> int:
         'version': __version__,
         'capabilities': [
             {'task': 'asr.transcribe', 'languages': LANGUAGES},
+            {'task': 'asr.stream', 'languages': LANGUAGES},
         ],
     })
 
@@ -254,6 +392,12 @@ def main() -> int:
         ftype = frame.get('type')
         if ftype == 'asr.transcribe':
             _handle_transcribe(frame)
+        elif ftype == 'asr.stream':
+            _handle_stream_start(frame)
+        elif ftype == 'asr.audio':
+            _handle_stream_audio(frame)
+        elif ftype == 'asr.stop':
+            _handle_stream_stop(frame)
         elif ftype == 'ready':
             continue
         elif ftype == 'cancel':

@@ -99,12 +99,34 @@ which Subtitld fetches from `https://subtitld.github.io/addons-catalog/catalog.j
 | add-on → host | `{"id","type":"result","data":{"segments":[…]}}` |
 | add-on → host | `{"id","type":"error","code","message"}` |
 
+## Live streaming (`asr.stream`)
+
+Besides the per-file `asr.transcribe` task, this add-on serves the live
+`asr.stream` task. Subtitld keeps owning the microphone and streams 16 kHz PCM
+chunks (`asr.audio`) into an open session; the add-on runs a continuous
+RealtimeSTT recognizer and streams back interim (`final:false`) and committed
+(`final:true`) `partial` frames, ending with a `result` on `asr.stop`. Subtitld
+shows interim text separately and commits only finalized phrases to subtitles.
+
+```
+host → us   {"id":<sid>,"type":"asr.stream","params":{language,options,samplerate}}
+host → us   {"id":<sid>,"type":"asr.audio","data":{"pcm":"<base64 int16>"}}   (repeated)
+host → us   {"id":<sid>,"type":"asr.stop"}
+us → host   {"id":<sid>,"type":"partial","data":{start,end,text,speaker,final}}
+us → host   {"id":<sid>,"type":"result","data":{"segments":[…]}}
+```
+
+Test it without a model:
+
+```bash
+python tests/test_stream.py
+```
+
 ## Notes & limitations
 
-- **Batch per-phrase, not a live mic stream.** This fits Subtitld's existing
-  `asr.transcribe` (file-in → text-out) contract: Subtitld owns the microphone
-  and VAD and feeds this add-on one short clip per phrase. A future protocol
-  extension could let the add-on own a continuous RealtimeSTT stream directly.
+- **Timing.** Streaming segments carry the recognized text; Subtitld bounds each
+  committed cue by the playhead (fed audio isn't word-timestamped). A trailing
+  phrase still in progress at `asr.stop` may be dropped rather than committed.
 - **PyInstaller packaging of torch/faster-whisper** is finicky and needs
   per-platform validation on real hardware; the `.spec` collects the known
   packages but expect to iterate on the first release.

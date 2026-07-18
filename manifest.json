@@ -12,7 +12,7 @@
   "startup_timeout_sec": 20,
   "request_timeout_sec": 900,
   "platforms": ["linux", "macos", "windows"],
-  "tasks": ["asr.transcribe"],
+  "tasks": ["asr.transcribe", "asr.stream"],
   "languages": [
     "en", "pt", "pt-br", "es", "fr", "de", "it", "nl", "ru", "pl", "uk", "tr",
     "ar", "zh", "ja", "ko", "hi", "id", "sv", "fi", "da", "no", "cs", "el",
