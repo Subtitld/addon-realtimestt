@@ -33,32 +33,53 @@ sys.path.insert(0, REPO_ROOT)
 from realtimestt_addon import __main__ as addon  # noqa: E402
 
 
+SR = 16000
+
+
 class FakeRecorder:
+    post_speech_silence_duration = 0.6
+
     def __init__(self, transcribe_delay=0.0):
         self.state = 'inactive'
         self.is_recording = False
         self.transcribe_delay = transcribe_delay
         self._queue = []
         self._phrase = None
+        self._phrase_samples = 0
         self._start = threading.Event()
         self._stop = threading.Event()
-        self._interrupt = threading.Event()
+        self.interrupt_stop_event = threading.Event()
         self._interrupted = threading.Event()
+        self.last_frames = []
         self.aborts = 0
         self.stops = 0
         self.shut_down = threading.Event()
         self.on_realtime_transcription_update = None
+        self.on_recorded_chunk = None
+        self.on_recording_stop = None
 
     # -- test controls -----------------------------------------------------
-    def say(self, text):
-        """Speech starts: a phrase is being recorded."""
+    def advance(self, seconds):
+        """The recording worker takes `seconds` more audio."""
+        n = int(round(seconds * SR))
+        if self.on_recorded_chunk:
+            self.on_recorded_chunk(b'\0\0' * n)
+        if self.is_recording:
+            self._phrase_samples += n
+
+    def say(self, text, seconds=1.0, preroll=0.0):
+        """Speech is detected; the recording starts with `preroll` seconds of
+        buffered audio and runs for `seconds`."""
         self._phrase = text
+        self._phrase_samples = int(round(preroll * SR))
         self.is_recording = True
         self.state = 'recording'
         self._start.set()
+        self.advance(seconds)
 
     def finish_phrase(self):
-        """The VAD ends the phrase on its own (silence after speech)."""
+        """The VAD ends the phrase: trailing silence, then stop."""
+        self.advance(self.post_speech_silence_duration)
         self.stop()
 
     # -- RealtimeSTT surface -------------------------------------------------
@@ -66,16 +87,16 @@ class FakeRecorder:
         return bool(self._queue)
 
     def text(self):
-        self._interrupt.clear()
+        self.interrupt_stop_event.clear()
         if not self._queue:
             if not self.is_recording:
                 self.state = 'listening'
-                while not self._interrupt.is_set() and not self._start.wait(0.01):
+                while not self.interrupt_stop_event.is_set() and not self._start.wait(0.01):
                     pass
-            if self.is_recording and not self._interrupt.is_set():
-                while not self._interrupt.is_set() and not self._stop.wait(0.01):
+            if self.is_recording and not self.interrupt_stop_event.is_set():
+                while not self.interrupt_stop_event.is_set() and not self._stop.wait(0.01):
                     pass
-        if self._interrupt.is_set():
+        if self.interrupt_stop_event.is_set():
             self._interrupted.set()
             return ''
         self._start.clear()
@@ -83,6 +104,7 @@ class FakeRecorder:
         if not self._queue:
             return ''
         text = self._queue.pop(0)
+        self.last_frames = []            # wait_audio() clears it once consumed
         self.state = 'transcribing'
         time.sleep(self.transcribe_delay)
         self.state = 'inactive'
@@ -90,14 +112,19 @@ class FakeRecorder:
 
     def stop(self):
         self.stops += 1
-        self._queue.append(self._phrase or '')
+        self.last_frames = [b'\0\0' * self._phrase_samples] if self._phrase_samples else []
+        if self.last_frames:
+            self._queue.append(self._phrase or '')
         self._phrase = None
+        self._phrase_samples = 0
         self.is_recording = False
         self._stop.set()
+        if self.on_recording_stop:
+            self.on_recording_stop()
 
     def abort(self):
         self.aborts += 1
-        self._interrupt.set()
+        self.interrupt_stop_event.set()
         if self.state != 'inactive':
             self._interrupted.wait(5)
         self._interrupted.clear()
@@ -268,3 +295,41 @@ def test_shutdown_finishes_a_live_stream(monkeypatch, frames):
     result = [f for f in frames if f.get('id') == 's1' and f.get('type') == 'result']
     assert len(result) == 1
     assert _texts(result[0]) == ['last words']
+
+
+def test_finals_carry_where_they_were_spoken(monkeypatch, frames):
+    """Stream-relative stamps, so the host places text by time instead of
+    guessing which of its cues a sentence belongs to."""
+    rec = FakeRecorder()
+    _start(monkeypatch, 's1', rec)
+    rec.advance(0.5)                                  # silence before speech
+    rec.say('one', seconds=1.2, preroll=0.3)          # recording began at 0.2
+    rec.finish_phrase()                               # speech ended at 1.7
+    _wait_for(lambda: len([f for f in frames if f.get('type') == 'partial']) == 1)
+    rec.advance(1.0)
+    rec.say('two', seconds=0.8, preroll=0.3)          # 3.3 .. 4.1 (+ pre-roll)
+    _wait_for(lambda: rec.state == 'recording')
+    addon._handle_stream_stop({'id': 's1'})           # cut mid-phrase
+    result = _result(frames, 's1')
+    spans = [(s['start'], s['end']) for s in result['data']['segments']]
+    assert spans[0] == (0.2, 1.7)
+    # A manual stop has no trailing silence to take off.
+    assert spans[1] == (3.0, 4.1)
+    finals = [f['data'] for f in frames if f.get('type') == 'partial' and f['data'].get('final')]
+    assert [(d['start'], d['end']) for d in finals] == spans
+
+
+def test_interrupted_text_does_not_consume_a_span(monkeypatch, frames):
+    rec = FakeRecorder()
+    _start(monkeypatch, 's1', rec)
+    st = addon._STREAM
+    rec.say('one', seconds=1.0)
+    rec.finish_phrase()
+    _wait_for(lambda: rec.state == 'listening')
+    # A recording whose text() gets interrupted leaves its span queued...
+    st['clock']._spans.append((9.0, 9.5))
+    addon._handle_stream_stop({'id': 's1'})
+    result = _result(frames, 's1')
+    assert [(s['start'], s['end']) for s in result['data']['segments']] == [(0.0, 1.0)]
+    # ...rather than being popped by the aborted call.
+    assert list(st['clock']._spans) == [(9.0, 9.5)]

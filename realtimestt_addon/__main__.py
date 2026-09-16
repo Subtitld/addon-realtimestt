@@ -37,6 +37,7 @@ contract can be verified without downloading a model.
 from __future__ import annotations
 
 import base64
+import collections
 import json
 import multiprocessing
 import os
@@ -218,6 +219,65 @@ _STREAM = None  # current session state, or None
 # which takes a moment on CPU. Generous, because giving up drops that phrase.
 _FINAL_SENTENCE_TIMEOUT = 60.0
 _FINISHERS = []   # sessions still collecting their last sentence
+_STREAM_RATE = 16000   # the host streams 16 kHz mono int16
+
+
+class _StreamClock:
+    """Where in the stream each recording RealtimeSTT transcribes lies.
+
+    RealtimeSTT's finals are bare text. Without timing the host has to guess
+    which of its own phrase cuts a sentence belongs to, and a guess goes wrong
+    as soon as the engine lags behind the speaker. So we stamp each final:
+
+    * every chunk the recording worker takes is counted (`on_recorded_chunk`
+      runs in that worker, before the chunk is examined), so the count is the
+      stream position the worker has reached;
+    * when a recording stops, `last_frames` holds exactly the audio queued
+      for transcription (pre-roll included), so it began that long before;
+    * `text()` transcribes queued recordings in order, one per call, so the
+      spans are consumed in the same order.
+
+    Stamps are stream-relative seconds. A stop that followed trailing silence
+    (the VAD's decision) has that silence taken off the end.
+    """
+
+    def __init__(self, recorder):
+        self._rec = recorder
+        self._processed = 0
+        self._spans = collections.deque()
+        self._lock = threading.Lock()
+        self.manual_stop = False
+
+    def attach(self):
+        try:
+            self._rec.on_recorded_chunk = self._on_chunk
+            self._rec.on_recording_stop = self._on_stop
+        except Exception:
+            pass
+
+    def _on_chunk(self, data):
+        self._processed += len(data) // 2
+
+    def _on_stop(self):
+        try:
+            frames = getattr(self._rec, 'last_frames', None)
+            if not frames:
+                return   # nothing was queued, so no text() will answer for it
+            total = sum(len(f) for f in frames) // 2
+            end = self._processed
+            start = max(0, end - total)
+            if not self.manual_stop:
+                silence = float(getattr(self._rec, 'post_speech_silence_duration', 0) or 0)
+                end = max(start, end - int(silence * _STREAM_RATE))
+            with self._lock:
+                self._spans.append((round(start / _STREAM_RATE, 3),
+                                    round(end / _STREAM_RATE, 3)))
+        except Exception as exc:
+            _log(f'stream clock: {exc}')
+
+    def take(self):
+        with self._lock:
+            return self._spans.popleft() if self._spans else None
 
 
 def _stream_recorder(language: str):
@@ -243,6 +303,9 @@ def _stream_recorder(language: str):
         realtime_model_type=model,
         level=0,
         no_log_file=True,
+        # Dropping a backlog would lose speech AND desynchronise the stream
+        # clock; a transcription tool would rather lag.
+        handle_buffer_overflow=False,
     )
 
 
@@ -253,7 +316,8 @@ def _handle_stream_start(frame: dict) -> None:
     language = str(params.get('language', '') or '')
     fake = os.environ.get('SUBTITLD_REALTIMESTT_FAKE') == '1'
     st = {'id': sid, 'fake': fake, 'segments': [], 'audio_count': 0,
-          'stopping': threading.Event(), 'recorder': None, 'thread': None}
+          'stopping': threading.Event(), 'recorder': None, 'thread': None,
+          'clock': None}
     _STREAM = st
 
     if fake:
@@ -272,6 +336,9 @@ def _handle_stream_start(frame: dict) -> None:
         _STREAM = None
         return
     _STREAM['recorder'] = recorder
+    clock = _StreamClock(recorder)
+    clock.attach()
+    st['clock'] = clock
 
     def _on_realtime(text):
         # Interims only while live: after stop they would describe a phrase
@@ -294,9 +361,18 @@ def _handle_stream_start(frame: dict) -> None:
                 sentence = recorder.text()
             except Exception:
                 break
+            # An interrupted text() consumed nothing; any other return, even
+            # an empty one, used up one queued recording and its span.
+            interrupted = False
+            try:
+                interrupted = recorder.interrupt_stop_event.is_set()
+            except Exception:
+                pass
+            span = None if interrupted else clock.take()
             text = (sentence or '').strip()
             if text:
-                seg = {'start': 0.0, 'end': 0.0, 'text': text, 'speaker': 'A'}
+                start, end = span if span else (0.0, 0.0)
+                seg = {'start': start, 'end': end, 'text': text, 'speaker': 'A'}
                 st['segments'].append(seg)
                 _send({'id': sid, 'type': 'partial', 'data': {**seg, 'final': True}})
             # Once stopping, drain what stop() queued and then leave, rather
@@ -384,6 +460,9 @@ def _finish_stream(st: dict) -> None:
             # spurious final sentence.
             try:
                 if rec.is_recording:
+                    # Cut mid-speech: no trailing silence to take off.
+                    if st.get('clock') is not None:
+                        st['clock'].manual_stop = True
                     rec.stop()
             except Exception as exc:
                 _log(f'stop failed: {exc}')
