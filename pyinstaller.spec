@@ -18,6 +18,7 @@ root, which is where Subtitld's installer reads it from.
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -26,9 +27,19 @@ SPEC_ROOT = Path(SPECPATH).resolve()
 
 # RealtimeSTT / faster-whisper load native libs and data files lazily; collect
 # their packages wholesale so nothing is missing at runtime.
+# silero_vad ships the ONNX VAD models RealtimeSTT looks up at recorder start.
+BUNDLED_PACKAGES = ('RealtimeSTT', 'faster_whisper', 'ctranslate2', 'webrtcvad',
+                    'tokenizers', 'onnxruntime', 'silero_vad')
+
+# collect_all() only *warns* for a package that isn't installed, so a missing
+# dependency used to produce a bundle that failed at runtime. Fail the build.
+_missing = [pkg for pkg in BUNDLED_PACKAGES if importlib.util.find_spec(pkg) is None]
+if _missing:
+    raise SystemExit('pyinstaller.spec: not installed in the build env: '
+                     + ', '.join(_missing) + " (pip install -e '.[build]')")
+
 datas, binaries, hiddenimports = [], [], []
-for pkg in ('RealtimeSTT', 'faster_whisper', 'ctranslate2', 'webrtcvad',
-            'tokenizers', 'onnxruntime', 'silero_vad'):
+for pkg in BUNDLED_PACKAGES:
     try:
         d, b, h = collect_all(pkg)
         datas += d

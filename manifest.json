@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "id": "realtimestt",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "display_name": "RealtimeSTT",
   "summary": "Recording-based speech-to-text via RealtimeSTT (faster-whisper + VAD). Built for Subtitld's Record mode; also transcribes imported audio. GPU-accelerated when available.",
   "author": "Subtitld",

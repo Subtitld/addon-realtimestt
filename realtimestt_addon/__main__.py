@@ -38,9 +38,11 @@ from __future__ import annotations
 
 import base64
 import json
+import multiprocessing
 import os
 import sys
 import threading
+import time
 import wave
 
 try:
@@ -64,12 +66,27 @@ LANGUAGES = [
 
 _SEND_LOCK = threading.Lock()   # streaming emits from a worker thread too
 
+# The JSON protocol owns the process's real stdin/stdout. main() hands library
+# code harmless stand-ins, so nothing else can read a host frame or write into
+# the frame stream. (torch.hub's trust prompt -- RealtimeSTT's last-resort
+# Silero VAD loader -- calls input(): it printed its question in front of our
+# next frame and consumed an asr.audio frame as the answer.)
+_PROTO_IN = sys.stdin
+_PROTO_OUT = sys.stdout
+
+
+def _claim_protocol_stdio() -> None:
+    global _PROTO_IN, _PROTO_OUT
+    _PROTO_IN, _PROTO_OUT = sys.stdin, sys.stdout
+    sys.stdin = open(os.devnull, encoding='utf-8')   # stray input() -> EOFError
+    sys.stdout = sys.stderr                          # stray print() -> the log
+
 
 def _send(frame: dict) -> None:
     line = json.dumps(frame, separators=(',', ':')) + '\n'
     with _SEND_LOCK:
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        _PROTO_OUT.write(line)
+        _PROTO_OUT.flush()
 
 
 def _log(msg: str) -> None:
@@ -196,6 +213,12 @@ def _realtimestt_transcribe(pcm: bytes, duration: float, language: str,
 # --------------------------------------------------------------------------- #
 _STREAM = None  # current session state, or None
 
+# Finishing a stream means waiting for the phrase that was being spoken when
+# the host said stop: stop() hands it to RealtimeSTT for a final transcription,
+# which takes a moment on CPU. Generous, because giving up drops that phrase.
+_FINAL_SENTENCE_TIMEOUT = 60.0
+_FINISHERS = []   # sessions still collecting their last sentence
+
 
 def _stream_recorder(language: str):
     """A RealtimeSTT recorder wired for continuous, interim-emitting use."""
@@ -229,8 +252,9 @@ def _handle_stream_start(frame: dict) -> None:
     params = frame.get('params', {}) or {}
     language = str(params.get('language', '') or '')
     fake = os.environ.get('SUBTITLD_REALTIMESTT_FAKE') == '1'
-    _STREAM = {'id': sid, 'fake': fake, 'segments': [], 'audio_count': 0,
-               'stop': threading.Event(), 'recorder': None, 'thread': None}
+    st = {'id': sid, 'fake': fake, 'segments': [], 'audio_count': 0,
+          'stopping': threading.Event(), 'recorder': None, 'thread': None}
+    _STREAM = st
 
     if fake:
         return   # interim/final are driven by incoming asr.audio frames
@@ -250,8 +274,10 @@ def _handle_stream_start(frame: dict) -> None:
     _STREAM['recorder'] = recorder
 
     def _on_realtime(text):
+        # Interims only while live: after stop they would describe a phrase
+        # whose final text is already on its way.
         t = (text or '').strip()
-        if t and _STREAM is not None and _STREAM['id'] == sid:
+        if t and not st['stopping'].is_set():
             _send({'id': sid, 'type': 'partial',
                    'data': {'start': 0.0, 'end': 0.0, 'text': t, 'speaker': 'A', 'final': False}})
     try:
@@ -260,18 +286,23 @@ def _handle_stream_start(frame: dict) -> None:
         pass
 
     def _sentence_loop():
-        # recorder.text() blocks until a full sentence; loop until stopped.
-        while _STREAM is not None and not _STREAM['stop'].is_set():
+        # recorder.text() blocks until a full sentence. Loop on THIS session's
+        # state, never the module global: after stop the global belongs to the
+        # next session, and a late sentence must not land in its list.
+        while True:
             try:
                 sentence = recorder.text()
             except Exception:
                 break
-            s = (sentence or '').strip()
-            if not s or _STREAM is None:
-                continue
-            seg = {'start': 0.0, 'end': 0.0, 'text': s, 'speaker': 'A'}
-            _STREAM['segments'].append(seg)
-            _send({'id': sid, 'type': 'partial', 'data': {**seg, 'final': True}})
+            text = (sentence or '').strip()
+            if text:
+                seg = {'start': 0.0, 'end': 0.0, 'text': text, 'speaker': 'A'}
+                st['segments'].append(seg)
+                _send({'id': sid, 'type': 'partial', 'data': {**seg, 'final': True}})
+            # Once stopping, drain what stop() queued and then leave, rather
+            # than calling text() again and waiting for speech that won't come.
+            if st['stopping'].is_set() and not _has_pending(recorder):
+                break
 
     th = threading.Thread(target=_sentence_loop, daemon=True)
     _STREAM['thread'] = th
@@ -304,21 +335,87 @@ def _handle_stream_audio(frame: dict) -> None:
             _log(f'feed_audio failed: {exc}')
 
 
+def _has_pending(recorder) -> bool:
+    try:
+        return bool(recorder.has_pending_recordings())
+    except Exception:
+        return False
+
+
 def _handle_stream_stop(frame: dict) -> None:
+    """Finish a stream WITHOUT dropping the phrase in progress.
+
+    This used to send the result right after rec.stop() and clear the session,
+    so the sentence stop() had just handed over for transcription arrived to a
+    loop that discarded it: the last thing said before pause was always lost.
+    Finishing now runs on its own thread, so the frame loop stays free and a
+    new stream can start immediately.
+    """
     global _STREAM
     st = _STREAM
     if not st or st['id'] != frame.get('id'):
         return
-    sid = st['id']
-    st['stop'].set()
-    rec = st.get('recorder')
-    if rec is not None:
+    _STREAM = None
+    t = threading.Thread(target=_finish_stream, args=(st,), daemon=True,
+                         name=f'realtimestt-finish-{st["id"]}')
+    _FINISHERS[:] = [f for f in _FINISHERS if f.is_alive()]
+    _FINISHERS.append(t)
+    t.start()
+
+
+def _abort_quietly(recorder) -> None:
+    """abort() blocks until a pending text() acknowledges it, so it must not
+    run on a thread that has to finish."""
+    def _go():
         try:
-            rec.stop()      # unblocks a pending text() so the loop can exit
+            recorder.abort()
         except Exception:
             pass
-    _send({'id': sid, 'type': 'result', 'data': {'segments': st['segments']}})
-    _STREAM = None
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def _finish_stream(st: dict) -> None:
+    rec = st.get('recorder')
+    loop = st.get('thread')
+    try:
+        if rec is not None and loop is not None:
+            # Only stop an ACTIVE recording. stop() on an idle recorder still
+            # queues its frame buffer, which would be transcribed as a
+            # spurious final sentence.
+            try:
+                if rec.is_recording:
+                    rec.stop()
+            except Exception as exc:
+                _log(f'stop failed: {exc}')
+            st['stopping'].set()
+
+            deadline = time.monotonic() + _FINAL_SENTENCE_TIMEOUT
+            aborted = False
+            while loop.is_alive() and time.monotonic() < deadline:
+                # Idle and waiting for speech: nothing left to collect, and
+                # stop() does not wake that wait — only abort() does.
+                if (not aborted and getattr(rec, 'state', '') == 'listening'
+                        and not rec.is_recording and not _has_pending(rec)):
+                    _abort_quietly(rec)
+                    aborted = True
+                loop.join(timeout=0.05)
+            if loop.is_alive():
+                _log('last sentence did not arrive in time; answering without it')
+                _abort_quietly(rec)
+    finally:
+        _send({'id': st['id'], 'type': 'result',
+               'data': {'segments': list(st['segments'])}})
+        if rec is not None:
+            # Each session builds its own recorder with two whisper models;
+            # without this they accumulated for the life of the process.
+            threading.Thread(target=_shutdown_quietly, args=(rec,), daemon=True).start()
+
+
+def _shutdown_quietly(recorder) -> None:
+    try:
+        recorder.shutdown()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -367,7 +464,57 @@ def _handle_transcribe(frame: dict) -> None:
     _send({'id': req_id, 'type': 'result', 'data': {'segments': segments}})
 
 
+def _self_test() -> int:
+    """`realtimestt-addon --self-test`: check a (frozen) build offline.
+
+    Verifies what a missing package or data file would otherwise only break
+    mid-recording: Silero VAD loads from the bundled silero_vad ONNX model
+    (no torch.hub download/prompt), and multiprocessing helpers start as
+    helpers rather than as a second copy of the add-on. Needs no model.
+    """
+    failures = []
+    try:
+        import numpy as np
+        from RealtimeSTT.core.silero_vad import create_silero_vad_model
+        vad = create_silero_vad_model(backend='auto')
+        backend = str(getattr(vad, 'backend', '?'))
+        prob = float(vad(np.zeros(512, dtype=np.float32), 16000))
+        _log(f'self-test: silero backend={backend} p(silence)={prob:.3f}')
+        if not backend.startswith('raw_onnx'):
+            failures.append(f'silero backend is {backend}, expected raw_onnx*')
+    except Exception as exc:
+        failures.append(f'silero VAD failed: {exc!r}')
+
+    ctx = multiprocessing.get_context('spawn')
+    queue = ctx.Queue()
+    child = ctx.Process(target=queue.put, args=('child-ok',))
+    child.start()
+    try:
+        got = queue.get(timeout=60)
+    except Exception:
+        got = None
+    child.join(10)
+    _log(f'self-test: spawn child returned {got!r}')
+    if got != 'child-ok':
+        failures.append('spawned child did not run (multiprocessing.freeze_support?)')
+
+    for failure in failures:
+        _log(f'self-test FAILED: {failure}')
+    if not failures:
+        _log('self-test OK')
+    return 1 if failures else 0
+
+
 def main() -> int:
+    # Frozen builds re-launch this executable for multiprocessing helpers
+    # (RealtimeSTT's mp.Event()s start the resource tracker under 'spawn';
+    # on Windows/macOS its transcription worker is an mp.Process). Without
+    # this, each helper ran *this* main loop instead: a second `hello`, and a
+    # second reader competing for the host's stdin. No-op when not frozen.
+    multiprocessing.freeze_support()
+    _claim_protocol_stdio()
+    if '--self-test' in sys.argv[1:]:
+        return _self_test()
     _send({
         'type': 'hello',
         'protocol': PROTOCOL_VERSION,
@@ -379,7 +526,7 @@ def main() -> int:
         ],
     })
 
-    for raw in sys.stdin:
+    for raw in _PROTO_IN:
         line = raw.strip()
         if not line:
             continue
@@ -404,6 +551,14 @@ def main() -> int:
             continue  # per-utterance work is short; nothing to abort
         elif ftype == 'shutdown':
             _log('shutdown received')
+            # A live stream is finished like a stop, and every session still
+            # collecting its last sentence gets a bounded moment to answer.
+            live = _STREAM
+            if live is not None:
+                _handle_stream_stop({'id': live['id']})
+            deadline = time.monotonic() + 5.0
+            for finisher in list(_FINISHERS):
+                finisher.join(timeout=max(0.0, deadline - time.monotonic()))
             try:
                 if _RECORDER is not None:
                     _RECORDER.shutdown()

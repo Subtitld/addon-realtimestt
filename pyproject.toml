@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subtitld-addon-realtimestt"
-version = "0.1.1"
+version = "0.1.2"
 description = "Subtitld add-on: recording-based ASR via RealtimeSTT (faster-whisper + VAD)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -13,7 +13,13 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "RealtimeSTT[faster-whisper]>=0.3.0",
+    # Upper-bounded: an unpinned rebuild already pulled a newer torch and grew
+    # the bundle, and the release asset must stay under GitHub's 2 GiB cap.
+    "RealtimeSTT[faster-whisper]>=1.0.2,<2",
+    # RealtimeSTT >= 1.0 made Silero VAD an optional extra and loads its ONNX
+    # models from the installed silero_vad package. Without it the recorder
+    # falls back to torch.hub, which prompts on stdin and eats a host frame.
+    "silero-vad[onnx-cpu]>=6.2.1",
 ]
 
 [project.optional-dependencies]

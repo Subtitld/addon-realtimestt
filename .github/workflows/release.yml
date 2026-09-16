@@ -67,7 +67,11 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[build]'
+          pip install -e '.[build,dev]'
+
+      - name: Run tests
+        shell: bash
+        run: python -m pytest -q tests
 
       - name: Build PyInstaller bundle
         shell: bash
@@ -86,6 +90,16 @@ jobs:
           done
           echo "faster_whisper + ctranslate2 present in bundle"
 
+      - name: Self-test the frozen bundle
+        # Offline, no model: Silero VAD must load from the bundled silero_vad
+        # ONNX model (0.1.1 shipped without it and every recording failed),
+        # and multiprocessing helpers must start as helpers (freeze_support).
+        shell: bash
+        run: |
+          exe=dist/realtimestt-addon/realtimestt-addon
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          "$exe" --self-test < /dev/null
+
       - name: Stage release archive
         shell: bash
         run: |
@@ -102,6 +116,9 @@ jobs:
             python -c "import shutil,sys; shutil.make_archive(sys.argv[1], 'zip', '.')" "../${archive_name%.zip}" )
           ls -lah "$archive_name"
           echo "ARCHIVE_NAME=$archive_name" >> "$GITHUB_ENV"
+          # GitHub rejects release assets over 2 GiB, and only at upload time,
+          # after every platform has built. Fail here with a readable reason.
+          python -c "import os,sys; n=os.path.getsize(sys.argv[1]); print(f'{sys.argv[1]}: {n/2**30:.2f} GiB'); sys.exit('FATAL: archive exceeds 1.9 GiB, GitHub rejects assets over 2 GiB' if n > 1.9*2**30 else 0)" "$archive_name"
 
       - name: Compute checksum
         shell: bash
