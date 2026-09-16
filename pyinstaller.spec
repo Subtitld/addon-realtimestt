@@ -60,6 +60,12 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # setuptools >= 81 no longer ships pkg_resources, and nothing here
+        # needs it (webrtcvad only imports it on Python < 3.8). A runner can
+        # still have an empty `pkg_resources` folder left by an older
+        # setuptools; bundled, PyInstaller's pkg_resources runtime hook then
+        # crashes before the add-on starts (seen on the macOS runner).
+        'pkg_resources',
         # No GUI toolkit is used — keep the bundle lean.
         'PySide6', 'PyQt6', 'PyQt5',
         'tkinter', 'Tkinter', '_tkinter',

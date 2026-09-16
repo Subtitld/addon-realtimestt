@@ -637,6 +637,13 @@ def _self_test() -> int:
     """
     failures = []
     try:
+        # The whole engine module, as a stream session imports it: a missing
+        # or broken dependency anywhere in it fails here, not mid-recording.
+        from RealtimeSTT import AudioToTextRecorder  # noqa: F401
+        import faster_whisper  # noqa: F401
+    except Exception as exc:
+        failures.append(f'RealtimeSTT import failed: {exc!r}')
+    try:
         import numpy as np
         from RealtimeSTT.core.silero_vad import create_silero_vad_model
         vad = create_silero_vad_model(backend='auto')
