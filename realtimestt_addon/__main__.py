@@ -220,6 +220,15 @@ _STREAM = None  # current session state, or None
 _FINAL_SENTENCE_TIMEOUT = 60.0
 _FINISHERS = []   # sessions still collecting their last sentence
 _STREAM_RATE = 16000   # the host streams 16 kHz mono int16
+# Audio the host sent before stopping may still be queued inside RealtimeSTT
+# (a slow machine, or frames that arrived while models were loading).
+_DRAIN_TIMEOUT = 30.0
+# How long a new session waits for the previous one to finish, so it can
+# take over its warm recorder instead of loading two models again.
+_REUSE_WAIT = 10.0
+_ARM_TIMEOUT = 2.0
+_IDLE_LOCK = threading.Lock()
+_IDLE = {'recorder': None, 'language': None}   # a finished session's recorder
 
 
 class _StreamClock:
@@ -309,6 +318,59 @@ def _stream_recorder(language: str):
     )
 
 
+def _take_idle_recorder(language: str):
+    """The previous session's recorder, when it can serve this one.
+
+    Loading a recorder means loading two whisper models: seconds on a fast
+    machine, far longer on a slow one, for every press of Play. A session
+    that is still finishing is waited for briefly (its last sentence is
+    usually a second or two away); the audio the host sends meanwhile just
+    queues on stdin, and is fed when we get to it.
+    """
+    deadline = time.monotonic() + _REUSE_WAIT
+    for finisher in list(_FINISHERS):
+        finisher.join(timeout=max(0.0, deadline - time.monotonic()))
+    with _IDLE_LOCK:
+        recorder, parked_for = _IDLE['recorder'], _IDLE['language']
+        _IDLE.update(recorder=None, language=None)
+    if recorder is None:
+        return None
+    if parked_for != language:
+        threading.Thread(target=_shutdown_quietly, args=(recorder,), daemon=True).start()
+        return None
+    try:
+        # Nothing of the last take may leak into this one's pre-roll.
+        recorder.clear_audio_queue()
+    except Exception:
+        pass
+    _log('reusing the loaded recorder')
+    return recorder
+
+
+def _park_or_shutdown(st: dict, recorder) -> None:
+    """Keep a cleanly finished recorder for the next session; shut down
+    anything else (each holds two whisper models)."""
+    if st.get('clean'):
+        with _IDLE_LOCK:
+            if _IDLE['recorder'] is None:
+                _IDLE.update(recorder=recorder, language=st.get('language'))
+                return
+    threading.Thread(target=_shutdown_quietly, args=(recorder,), daemon=True).start()
+
+
+def _drain_input(recorder) -> None:
+    """Wait until RealtimeSTT has taken every sample already fed."""
+    try:
+        recorder.flush_audio_input()
+    except Exception:
+        pass
+    try:
+        if not recorder.drain_audio_input(timeout=_DRAIN_TIMEOUT):
+            _log('audio still queued after the drain timeout')
+    except Exception:
+        pass
+
+
 def _handle_stream_start(frame: dict) -> None:
     global _STREAM
     sid = frame.get('id')
@@ -317,14 +379,14 @@ def _handle_stream_start(frame: dict) -> None:
     fake = os.environ.get('SUBTITLD_REALTIMESTT_FAKE') == '1'
     st = {'id': sid, 'fake': fake, 'segments': [], 'audio_count': 0,
           'stopping': threading.Event(), 'recorder': None, 'thread': None,
-          'clock': None}
+          'clock': None, 'language': language, 'clean': False}
     _STREAM = st
 
     if fake:
         return   # interim/final are driven by incoming asr.audio frames
 
     try:
-        recorder = _stream_recorder(language)
+        recorder = _take_idle_recorder(language) or _stream_recorder(language)
     except ImportError as exc:
         _send({'id': sid, 'type': 'error', 'code': 'not_installed',
                'message': f'RealtimeSTT unavailable: {exc}'})
@@ -383,6 +445,23 @@ def _handle_stream_start(frame: dict) -> None:
     th = threading.Thread(target=_sentence_loop, daemon=True)
     _STREAM['thread'] = th
     th.start()
+    # RealtimeSTT only starts a recording on voice once text() has armed it.
+    # Audio that queued up meanwhile (models loading, the last take
+    # finishing) is fed in a burst, and speech at its head would be lost if
+    # it got there first.
+    _wait_until_listening(recorder, _ARM_TIMEOUT)
+
+
+def _wait_until_listening(recorder, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if recorder.is_recording or recorder.start_recording_on_voice_activity:
+                return
+        except Exception:
+            return
+        time.sleep(0.005)
+    _log('recorder did not start listening in time')
 
 
 def _handle_stream_audio(frame: dict) -> None:
@@ -455,6 +534,10 @@ def _finish_stream(st: dict) -> None:
     loop = st.get('thread')
     try:
         if rec is not None and loop is not None:
+            # Decide on what RealtimeSTT has actually processed: audio fed
+            # just before stop may still be queued, and an idle-looking
+            # recorder would be aborted with that speech unheard.
+            _drain_input(rec)
             # Only stop an ACTIVE recording. stop() on an idle recorder still
             # queues its frame buffer, which would be transcribed as a
             # spurious final sentence.
@@ -481,13 +564,14 @@ def _finish_stream(st: dict) -> None:
             if loop.is_alive():
                 _log('last sentence did not arrive in time; answering without it')
                 _abort_quietly(rec)
+            else:
+                st['clean'] = not _has_pending(rec)
     finally:
         _send({'id': st['id'], 'type': 'result',
                'data': {'segments': list(st['segments'])}})
         if rec is not None:
-            # Each session builds its own recorder with two whisper models;
-            # without this they accumulated for the life of the process.
-            threading.Thread(target=_shutdown_quietly, args=(rec,), daemon=True).start()
+            # Kept for the next session, or shut down: never left behind.
+            _park_or_shutdown(st, rec)
 
 
 def _shutdown_quietly(recorder) -> None:
@@ -638,6 +722,11 @@ def main() -> int:
             deadline = time.monotonic() + 5.0
             for finisher in list(_FINISHERS):
                 finisher.join(timeout=max(0.0, deadline - time.monotonic()))
+            with _IDLE_LOCK:
+                idle = _IDLE['recorder']
+                _IDLE.update(recorder=None, language=None)
+            if idle is not None:
+                _shutdown_quietly(idle)
             try:
                 if _RECORDER is not None:
                     _RECORDER.shutdown()

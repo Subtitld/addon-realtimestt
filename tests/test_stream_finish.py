@@ -86,11 +86,14 @@ class FakeRecorder:
     def has_pending_recordings(self):
         return bool(self._queue)
 
+    start_recording_on_voice_activity = False
+
     def text(self):
         self.interrupt_stop_event.clear()
         if not self._queue:
             if not self.is_recording:
                 self.state = 'listening'
+                self.start_recording_on_voice_activity = True
                 while not self.interrupt_stop_event.is_set() and not self._start.wait(0.01):
                     pass
             if self.is_recording and not self.interrupt_stop_event.is_set():
@@ -124,6 +127,7 @@ class FakeRecorder:
 
     def abort(self):
         self.aborts += 1
+        self.start_recording_on_voice_activity = False
         self.interrupt_stop_event.set()
         if self.state != 'inactive':
             self._interrupted.wait(5)
@@ -131,6 +135,23 @@ class FakeRecorder:
 
     def shutdown(self):
         self.shut_down.set()
+
+    # Manual-input pipeline: audio the worker has not taken yet.
+    def queue_backlog(self, *steps):
+        """Steps (method, args) the worker will run when drained."""
+        self._backlog = list(steps)
+
+    def flush_audio_input(self):
+        return False
+
+    def drain_audio_input(self, timeout=None):
+        for name, args in getattr(self, '_backlog', []):
+            getattr(self, name)(*args)
+        self._backlog = []
+        return True
+
+    def clear_audio_queue(self):
+        self.cleared = getattr(self, 'cleared', 0) + 1
 
 
 @pytest.fixture
@@ -145,6 +166,7 @@ def frames(monkeypatch):
     monkeypatch.setattr(addon, '_send', _send)
     monkeypatch.setattr(addon, '_STREAM', None)
     monkeypatch.setattr(addon, '_FINISHERS', [])
+    monkeypatch.setattr(addon, '_IDLE', {'recorder': None, 'language': None})
     return sent
 
 
@@ -251,15 +273,82 @@ def test_late_sentence_never_leaks_into_the_next_session(monkeypatch, frames):
     _result(frames, 's2')
 
 
-def test_recorder_is_shut_down_after_the_session(monkeypatch, frames):
-    """Each session builds a recorder with two whisper models; they used to
-    accumulate for the life of the process."""
+def test_recorder_is_kept_for_the_next_session(monkeypatch, frames):
+    """Each recorder holds two whisper models: one finished cleanly serves
+    the next session instead of being loaded again."""
     rec = FakeRecorder()
     _start(monkeypatch, 's1', rec)
     _wait_for(lambda: rec.state == 'listening')
     addon._handle_stream_stop({'id': 's1'})
     _result(frames, 's1')
+    _wait_for(lambda: addon._IDLE['recorder'] is rec)
+    assert not rec.shut_down.is_set()
+
+    built = []
+    monkeypatch.setattr(addon, '_stream_recorder', lambda language: built.append(language))
+    addon._handle_stream_start({'id': 's2', 'params': {'language': 'en'}})
+    assert built == [] and addon._STREAM['recorder'] is rec
+    assert rec.cleared == 1             # no pre-roll from the last take
+    rec.say('second take', seconds=1.0)
+    rec.finish_phrase()
+    _wait_for(lambda: any(f.get('id') == 's2' and f.get('type') == 'partial' for f in frames))
+    addon._handle_stream_stop({'id': 's2'})
+    assert _texts(_result(frames, 's2')) == ['second take']
+
+
+def test_other_language_gets_its_own_recorder(monkeypatch, frames):
+    rec = FakeRecorder()
+    _start(monkeypatch, 's1', rec)
+    _wait_for(lambda: rec.state == 'listening')
+    addon._handle_stream_stop({'id': 's1'})
+    _result(frames, 's1')
+    _wait_for(lambda: addon._IDLE['recorder'] is rec)
+    other = FakeRecorder()
+    monkeypatch.setattr(addon, '_stream_recorder', lambda language: other)
+    addon._handle_stream_start({'id': 's2', 'params': {'language': 'pt'}})
+    assert addon._STREAM['recorder'] is other
     assert rec.shut_down.wait(2.0)
+    addon._handle_stream_stop({'id': 's2'})
+    _result(frames, 's2')
+
+
+def test_a_timed_out_recorder_is_not_reused(monkeypatch, frames):
+    monkeypatch.setattr(addon, '_FINAL_SENTENCE_TIMEOUT', 0.3)
+    rec = FakeRecorder(transcribe_delay=1.5)
+    _start(monkeypatch, 's1', rec)
+    rec.say('slow', seconds=1.0)
+    _wait_for(lambda: rec.state == 'recording')
+    addon._handle_stream_stop({'id': 's1'})
+    _result(frames, 's1')
+    assert rec.shut_down.wait(2.0)
+    assert addon._IDLE['recorder'] is None
+
+
+def test_quick_resume_waits_for_the_finishing_session(monkeypatch, frames):
+    """Play pressed again while the last sentence is still transcribing."""
+    rec = FakeRecorder(transcribe_delay=0.5)
+    _start(monkeypatch, 's1', rec)
+    rec.say('before pause', seconds=1.0)
+    _wait_for(lambda: rec.state == 'recording')
+    addon._handle_stream_stop({'id': 's1'})
+    built = []
+    monkeypatch.setattr(addon, '_stream_recorder', lambda language: built.append(language))
+    addon._handle_stream_start({'id': 's2', 'params': {'language': 'en'}})
+    assert _texts(_result(frames, 's1')) == ['before pause']
+    assert built == [] and addon._STREAM['recorder'] is rec
+    addon._handle_stream_stop({'id': 's2'})
+    _result(frames, 's2')
+
+
+def test_backlog_is_heard_before_finishing(monkeypatch, frames):
+    """Audio fed just before stop, still queued inside RealtimeSTT (e.g. it
+    arrived while the models were loading), is transcribed, not aborted."""
+    rec = FakeRecorder()
+    _start(monkeypatch, 's1', rec)
+    _wait_for(lambda: rec.state == 'listening')
+    rec.queue_backlog(('say', ('still queued', 1.0)))
+    addon._handle_stream_stop({'id': 's1'})
+    assert _texts(_result(frames, 's1')) == ['still queued']
 
 
 def test_stale_stop_is_ignored(monkeypatch, frames):
@@ -269,6 +358,18 @@ def test_stale_stop_is_ignored(monkeypatch, frames):
     assert addon._STREAM is not None and addon._STREAM['id'] == 's1'
     addon._handle_stream_stop({'id': 's1'})
     _result(frames, 's1')
+
+
+def test_shutdown_releases_a_parked_recorder(monkeypatch, frames):
+    import io
+    rec = FakeRecorder()
+    monkeypatch.setitem(addon._IDLE, 'recorder', rec)
+    monkeypatch.setattr(sys, 'argv', ['realtimestt-addon'])
+    monkeypatch.setattr(sys, 'stdin', iter([json.dumps({'type': 'shutdown'}) + '\n']))
+    monkeypatch.setattr(sys, 'stdout', io.StringIO())
+    monkeypatch.setattr(addon, '_RECORDER', None)
+    assert addon.main() == 0
+    assert rec.shut_down.is_set()
 
 
 def test_shutdown_finishes_a_live_stream(monkeypatch, frames):
@@ -333,3 +434,20 @@ def test_interrupted_text_does_not_consume_a_span(monkeypatch, frames):
     assert [(s['start'], s['end']) for s in result['data']['segments']] == [(0.0, 1.0)]
     # ...rather than being popped by the aborted call.
     assert list(st['clock']._spans) == [(9.0, 9.5)]
+
+
+def test_start_returns_once_the_recorder_listens(monkeypatch, frames):
+    """Audio fed right after start must find voice detection armed."""
+    rec = FakeRecorder()
+    armed_at_return = []
+    real_start = addon._handle_stream_start
+
+    def start(frame):
+        real_start(frame)
+        armed_at_return.append(rec.start_recording_on_voice_activity)
+    monkeypatch.setattr(addon, '_stream_recorder', lambda language: rec)
+    monkeypatch.delenv('SUBTITLD_REALTIMESTT_FAKE', raising=False)
+    start({'id': 's1', 'params': {'language': 'en'}})
+    assert armed_at_return == [True]
+    addon._handle_stream_stop({'id': 's1'})
+    _result(frames, 's1')
