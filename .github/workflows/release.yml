@@ -28,7 +28,7 @@ jobs:
         include:
           - os: ubuntu-22.04
             platform_label: linux-x86_64
-          - os: macos-14   # Apple Silicon; the catalog can't distinguish mac
+          - os: macos-15   # Apple Silicon; the catalog can't distinguish mac
                            # arch, so we ship one macOS build (arm64) for v0.1.
             platform_label: macos-arm64
           - os: windows-2022
